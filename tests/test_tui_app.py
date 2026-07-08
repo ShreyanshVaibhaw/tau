@@ -89,6 +89,7 @@ from tau_coding.tui.config import (
     tui_settings_path,
 )
 from tau_coding.tui.state import ChatItem
+from tau_coding.tui.terminal_title import TerminalTitleController
 from tau_coding.tui.widgets import (
     LeftAlignedMarkdownHeading,
     StreamingTranscriptMessageWidget,
@@ -2252,6 +2253,65 @@ async def test_tui_app_shows_activity_indicator_while_running() -> None:
         assert not app.query("#status")
         assert prompt.styles.border.top[1].hex.lower() == "#2d3748"
         assert indicator.render().plain == "τ"
+
+
+@pytest.mark.anyio
+async def test_tui_app_updates_terminal_title_for_running_and_named_session() -> None:
+    session = FakeSession()
+    session._session_title = "build notes"
+    app = TauTuiApp(session)
+    writes: list[str] = []
+    app._terminal_title = TerminalTitleController(enabled=True, writer=writes.append)
+
+    async with app.run_test():
+        assert writes[-1] == "\x1b]0;τ | build notes\x07"
+
+        app.adapter.apply(AgentStartEvent())
+        app._refresh()
+        assert writes[-1] == "\x1b]0;⠋ τ | build notes\x07"
+
+        app._tick_activity()
+        assert writes[-1] == "\x1b]0;⠙ τ | build notes\x07"
+
+        session._session_title = "ship notes"
+        app._refresh_chrome()
+        assert writes[-1] == "\x1b]0;⠙ τ | ship notes\x07"
+
+        app.adapter.apply(AgentEndEvent())
+        app._refresh()
+        assert writes[-1] == "\x1b]0;τ | ship notes\x07"
+
+    assert writes[-1] == "\x1b]0;τ\x07"
+
+
+@pytest.mark.anyio
+async def test_tui_app_updates_terminal_title_after_auto_session_naming() -> None:
+    class AutoNamingSession(FakeSession):
+        async def prompt(
+            self,
+            text: str,
+            *,
+            streaming_behavior: str | None = None,
+        ) -> AsyncIterator[AgentEvent]:
+            del streaming_behavior
+            self.prompt_texts.append(text)
+            yield AgentStartEvent()
+            self._session_title = "Debug login"
+            yield MessageEndEvent(message=UserMessage(content=text))
+            yield AgentEndEvent()
+
+    app = TauTuiApp(AutoNamingSession())
+    writes: list[str] = []
+    app._terminal_title = TerminalTitleController(enabled=True, writer=writes.append)
+
+    async with app.run_test():
+        assert writes[-1] == "\x1b]0;τ\x07"
+
+        await app._run_prompt("debug the login flow")
+
+        assert "\x1b]0;τ | Debug login\x07" in writes
+        assert app.sub_title == "Debug login"
+        assert writes[-1] == "\x1b]0;τ | Debug login\x07"
 
 
 @pytest.mark.anyio
