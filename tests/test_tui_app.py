@@ -97,7 +97,6 @@ from tau_coding.tui.app import (
     TreePickerScreen,
     _activity_prompt_border_color,
     _completion_selected_render_line,
-    _filter_login_providers,
     _render_activity_indicator,
     _terminal_command_prefix_span,
     _textual_theme_for_tau_theme,
@@ -6494,25 +6493,26 @@ async def test_tui_login_api_provider_picker_highlights_first_provider() -> None
         screen = app.screen
         provider_list = screen.query_one("#login-provider-list", ListView)
 
-        # Refreshing must leave the first provider highlighted by the time it
-        # returns, with no further event-loop turns: a user pressing down
-        # immediately after the picker opens must not skip the first provider.
-        await screen._refresh_provider_list()
+        # The initial refresh must highlight the first provider before the
+        # picker can receive a navigation key.
         assert provider_list.index == 0
         assert provider_list.highlighted_child is not None
 
-        await pilot.press("down")
-        await pilot.pause()
-        assert provider_list.index == 1
-
-        # The same holds after filtering narrows the list.
-        screen.visible_providers = _filter_login_providers(screen.providers, "moonshot")
-        await screen._refresh_provider_list()
+        # Drive filtering through the search input event path. The refreshed
+        # list must still highlight its first match before Down/Enter arrive.
+        search = screen.query_one("#login-provider-search", Input)
+        search.value = "moonshot"
+        await pilot.wait_for_scheduled_animations()
         assert provider_list.index == 0
         assert screen.visible_providers[0].name.startswith("moonshot")
 
+        await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, LoginScreen)
+        assert app.screen.provider.name == "moonshotai-cn"
 
-@pytest.mark.anyio
+
 @pytest.mark.anyio
 async def test_tui_login_api_provider_picker_filters_by_name_and_display_name() -> None:
     app = TauTuiApp(FakeSession())
