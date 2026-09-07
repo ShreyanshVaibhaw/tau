@@ -3548,7 +3548,7 @@ async def test_anthropic_provider_reports_usage() -> None:
     assert isinstance(events[-1], AssistantDoneEvent)
     usage = events[-1].message.usage
     assert usage is not None
-    assert usage.input == 100
+    assert usage.input == 100  # Anthropic input excludes cache reads and writes
     assert usage.output == 7  # updated by message_delta
     assert usage.cache_read == 40
     assert usage.cache_write == 25
