@@ -50,6 +50,7 @@ from tau_ai.http_errors import provider_http_error_message
 from tau_ai.provider import CancellationToken
 from tau_ai.retry import provider_retry_event, retry_delay_seconds, wait_for_retry
 from tau_ai.stream import canonicalize_provider_stream
+from tau_ai.tool_call_ids import portable_tool_call_id
 
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MAX_TOKENS = 4096
@@ -96,8 +97,10 @@ class AnthropicProvider:
         messages: list[AgentMessage],
         tools: list[AgentTool],
         signal: CancellationToken | None = None,
+        session_id: str | None = None,
     ) -> AsyncIterator[AssistantMessageEvent]:
         """Stream one response as Pi-compatible assistant message events."""
+        del session_id
         raw = self._stream_provider_events(
             model=model, system=system, messages=messages, tools=tools, signal=signal
         )
@@ -206,6 +209,7 @@ class AnthropicProvider:
                             return
 
                         yield ProviderResponseStartEvent(model=model)
+                        stream_error: dict[str, JSONValue] | None = None
                         content_parts: list[str] = []
                         thinking_parts: list[str] = []
                         thinking_signature: str | None = None
@@ -282,12 +286,37 @@ class AnthropicProvider:
                                     )
                                 usage = _apply_message_delta_usage(usage, chunk.get("usage"))
                             elif event_type == "error":
-                                error = chunk.get("error")
-                                message = "Provider returned an error"
-                                if isinstance(error, Mapping):
-                                    message = _string_or_empty(error.get("message")) or message
-                                yield ProviderErrorEvent(message=message, data=chunk)
+                                error_type, message = _anthropic_stream_error_details(chunk)
+                                if (
+                                    not emitted_content
+                                    and self._should_retry(attempt)
+                                    and _retryable_anthropic_stream_error(error_type)
+                                ):
+                                    stream_error = chunk
+                                    break
+                                yield ProviderErrorEvent(
+                                    message=message,
+                                    data={"event": chunk, "attempts": attempt + 1},
+                                )
                                 return
+
+                        if stream_error is not None:
+                            error_type, _message = _anthropic_stream_error_details(stream_error)
+                            delay = retry_delay_seconds(
+                                attempt,
+                                max_delay_seconds=self._config.max_retry_delay_seconds,
+                            )
+                            yield provider_retry_event(
+                                attempt=attempt,
+                                max_retries=self._config.max_retries,
+                                delay_seconds=delay,
+                                reason=f"stream error ({error_type or 'unknown'})",
+                                data={"event": stream_error},
+                            )
+                            attempt += 1
+                            if not await wait_for_retry(delay, signal=signal):
+                                return
+                            continue
 
                         tool_calls = [
                             builder.build(index) for index, builder in sorted(tool_builders.items())
@@ -351,6 +380,30 @@ class AnthropicProvider:
         return status_code is None or status_code in {408, 409, 425, 429} or status_code >= 500
 
 
+_TRANSIENT_ANTHROPIC_STREAM_ERROR_TYPES = frozenset(
+    {
+        "api_error",
+        "overloaded_error",
+        "rate_limit_error",
+    }
+)
+
+
+def _anthropic_stream_error_details(event: Mapping[str, JSONValue]) -> tuple[str, str]:
+    """Return the provider classification and message from an Anthropic SSE error."""
+    error = event.get("error")
+    if not isinstance(error, Mapping):
+        return "", "Provider returned an error"
+    error_type = _string_or_empty(error.get("type"))
+    message = _string_or_empty(error.get("message")) or "Provider returned an error"
+    return error_type, message
+
+
+def _retryable_anthropic_stream_error(error_type: str) -> bool:
+    """Return whether an Anthropic SSE error is transient and safe to retry."""
+    return error_type.lower() in _TRANSIENT_ANTHROPIC_STREAM_ERROR_TYPES
+
+
 class _AnthropicToolBuilder:
     def __init__(self) -> None:
         self.id = ""
@@ -388,9 +441,14 @@ def _build_messages_payload(
     if thinking_budget_tokens is not None:
         resolved_max_tokens = max(resolved_max_tokens, thinking_budget_tokens + 1024)
     cache_control = _cache_control(cache_retention)
-    payload_messages = [
-        _anthropic_message(message, supports_images=supports_images) for message in messages
-    ]
+    payload_messages = []
+    for message in messages:
+        converted = _anthropic_message(message, supports_images=supports_images)
+        # Dropping foreign provider reasoning can empty a reasoning-only turn.
+        # Anthropic rejects empty assistant content, so omit that inert turn too.
+        if converted.get("role") == "assistant" and not converted.get("content"):
+            continue
+        payload_messages.append(converted)
     _apply_message_cache_breakpoints(payload_messages, cache_control)
     payload: dict[str, JSONValue] = {
         "model": model,
@@ -569,6 +627,11 @@ def _anthropic_message(message: AgentMessage, *, supports_images: bool) -> dict[
             if isinstance(block, TextContent):
                 content.append({"type": "text", "text": block.text})
             elif isinstance(block, ThinkingContent):
+                # Thinking signatures are provider-owned opaque state. Replaying
+                # an OpenAI/Google signature as an Anthropic thinking block makes
+                # an otherwise portable model switch fail validation.
+                if message.api != "anthropic-messages":
+                    continue
                 thinking: dict[str, JSONValue] = {
                     "type": "thinking",
                     "thinking": block.thinking,
@@ -580,7 +643,7 @@ def _anthropic_message(message: AgentMessage, *, supports_images: bool) -> dict[
                 content.append(
                     {
                         "type": "tool_use",
-                        "id": block.id,
+                        "id": portable_tool_call_id(block.id),
                         "name": block.name,
                         "input": block.arguments,
                     }
@@ -601,7 +664,7 @@ def _anthropic_message(message: AgentMessage, *, supports_images: bool) -> dict[
             "content": [
                 {
                     "type": "tool_result",
-                    "tool_use_id": message.tool_call_id,
+                    "tool_use_id": portable_tool_call_id(message.tool_call_id),
                     "content": result_content,
                     "is_error": bool(message.is_error),
                 }
@@ -637,9 +700,11 @@ def _anthropic_tool(
 
 
 def _parse_sse_line(line: str) -> str | None:
-    if not line.startswith("data:"):
+    line = line.strip()
+    if not line or not line.startswith("data:"):
         return None
-    return line.removeprefix("data:").strip()
+    data = line.removeprefix("data:").strip()
+    return data or None
 
 
 def _loads_object(text: str) -> dict[str, Any] | None:
@@ -658,6 +723,11 @@ def _int_or_none(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _nonnegative_int_or_none(value: object) -> int | None:
+    integer = _int_or_none(value)
+    return integer if integer is not None and integer >= 0 else None
+
+
 def _usage_from_message_start(raw: object) -> Usage:
     """Build a Usage from the ``message_start`` event's ``message.usage``.
 
@@ -667,15 +737,19 @@ def _usage_from_message_start(raw: object) -> Usage:
     data = raw if isinstance(raw, Mapping) else {}
     cache_creation = data.get("cache_creation")
     cache_write_1h = (
-        _int_or_none(cache_creation.get("ephemeral_1h_input_tokens"))
+        _nonnegative_int_or_none(cache_creation.get("ephemeral_1h_input_tokens"))
         if isinstance(cache_creation, Mapping)
         else None
     )
+    input_tokens = _nonnegative_int_or_none(data.get("input_tokens")) or 0
+    cache_read = _nonnegative_int_or_none(data.get("cache_read_input_tokens")) or 0
+    cache_write = _nonnegative_int_or_none(data.get("cache_creation_input_tokens")) or 0
     usage = Usage(
-        input=_int_or_none(data.get("input_tokens")) or 0,
-        output=_int_or_none(data.get("output_tokens")) or 0,
-        cache_read=_int_or_none(data.get("cache_read_input_tokens")) or 0,
-        cache_write=_int_or_none(data.get("cache_creation_input_tokens")) or 0,
+        # Anthropic's input_tokens already excludes cache reads and writes.
+        input=input_tokens,
+        output=_nonnegative_int_or_none(data.get("output_tokens")) or 0,
+        cache_read=cache_read,
+        cache_write=cache_write,
         cache_write_1h=cache_write_1h,
     )
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write
@@ -687,21 +761,22 @@ def _apply_message_delta_usage(usage: Usage | None, raw: object) -> Usage | None
 
     Ports Pi's anthropic-messages.ts message_delta handling: only overwrite
     fields the provider reports (non-null), then recompute the token total.
+    Anthropic's input_tokens already excludes cache reads and writes.
     """
     if not isinstance(raw, Mapping):
         return usage
     usage = usage or Usage()
-    if (value := _int_or_none(raw.get("input_tokens"))) is not None:
+    if (value := _nonnegative_int_or_none(raw.get("input_tokens"))) is not None:
         usage.input = value
-    if (value := _int_or_none(raw.get("output_tokens"))) is not None:
+    if (value := _nonnegative_int_or_none(raw.get("output_tokens"))) is not None:
         usage.output = value
-    if (value := _int_or_none(raw.get("cache_read_input_tokens"))) is not None:
+    if (value := _nonnegative_int_or_none(raw.get("cache_read_input_tokens"))) is not None:
         usage.cache_read = value
-    if (value := _int_or_none(raw.get("cache_creation_input_tokens"))) is not None:
+    if (value := _nonnegative_int_or_none(raw.get("cache_creation_input_tokens"))) is not None:
         usage.cache_write = value
     details = raw.get("output_tokens_details")
     if isinstance(details, Mapping):
-        thinking = _int_or_none(details.get("thinking_tokens"))
+        thinking = _nonnegative_int_or_none(details.get("thinking_tokens"))
         if thinking is not None:
             usage.reasoning = thinking
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write

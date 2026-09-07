@@ -35,15 +35,16 @@ class RuntimeProviderAuth:
 
 
 type RuntimeProviderAuthResolver = Callable[[], Awaitable[RuntimeProviderAuth]]
+type RuntimeResponseHeadersObserver = Callable[[Mapping[str, str]], None]
 
 
 @dataclass(frozen=True, slots=True)
 class OpenAICompatibleConfig:
     """Configuration for an OpenAI-compatible chat completions endpoint."""
 
-    api_key: str
+    api_key: str = field(repr=False)
     base_url: str = DEFAULT_OPENAI_COMPATIBLE_BASE_URL
-    headers: Mapping[str, str] | None = None
+    headers: Mapping[str, str] | None = field(default=None, repr=False)
     timeout_seconds: float = DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS
     max_retries: int = DEFAULT_OPENAI_COMPATIBLE_MAX_RETRIES
     max_retry_delay_seconds: float = DEFAULT_OPENAI_COMPATIBLE_MAX_RETRY_DELAY_SECONDS
@@ -54,10 +55,14 @@ class OpenAICompatibleConfig:
     reasoning_effort_parameter: str = "reasoning_effort"
     thinking_format: str = "openai"
     compat: Mapping[str, JSONValue] = field(default_factory=dict)
+    model_aliases: Mapping[str, str] = field(default_factory=dict)
     include_reasoning_effort_none: bool = False
     provider_name: str = "OpenAI-compatible provider"
+    response_provider_header: str | None = None
     omit_authorization_header: bool = False
     credential_resolver: RuntimeProviderAuthResolver | None = None
+    response_headers_observer: RuntimeResponseHeadersObserver | None = None
+    infer_api_from_model: bool = True
 
 
 @dataclass(frozen=True, slots=True)
